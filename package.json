@@ -1,0 +1,39 @@
+{
+  "name": "partitionforge",
+  "version": "0.2.2",
+  "description": "Open source disk and partition manager for Windows",
+  "author": {
+    "name": "Hillyard Tech"
+  },
+  "license": "GPL-3.0-or-later",
+  "main": "dist/main/index.js",
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:renderer\" \"npm:dev:electron\"",
+    "dev:renderer": "vite",
+    "dev:electron": "npm run build:main && cross-env PF_DEV=1 electron .",
+    "build:main": "tsc -p tsconfig.main.json",
+    "build:renderer": "vite build",
+    "build": "npm run build:main && npm run build:renderer",
+    "typecheck": "tsc -p tsconfig.main.json --noEmit && tsc -p tsconfig.renderer.json --noEmit",
+    "test": "npm run build:main && node tests/storage.cjs && python3 tests/offline.py",
+    "dist:win": "npm run build && electron-builder --win --x64 --publish never",
+    "mock": "cross-env PF_MOCK=1 PF_DEV=1 electron ."
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.17",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.0",
+    "cross-env": "^7.0.3",
+    "electron": "^33.3.1",
+    "electron-builder": "^25.1.8",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.11",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}

@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1d2432"/><stop offset="1" stop-color="#111520"/>
+    </linearGradient>
+    <linearGradient id="a" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4c8dff"/><stop offset="1" stop-color="#2f6fe0"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+  <rect x="34" y="34" width="188" height="188" rx="40" fill="none" stroke="#2b3444" stroke-width="3"/>
+  <!-- platter -->
+  <circle cx="128" cy="128" r="74" fill="none" stroke="#39435a" stroke-width="10"/>
+  <!-- three partition arcs of different sizes -->
+  <circle cx="128" cy="128" r="74" fill="none" stroke="url(#a)" stroke-width="10"
+          stroke-linecap="round" stroke-dasharray="200 265" transform="rotate(-90 128 128)"/>
+  <circle cx="128" cy="128" r="74" fill="none" stroke="#29b6a8" stroke-width="10"
+          stroke-linecap="round" stroke-dasharray="95 370" transform="rotate(50 128 128)"/>
+  <circle cx="128" cy="128" r="74" fill="none" stroke="#e0a13c" stroke-width="10"
+          stroke-linecap="round" stroke-dasharray="45 420" transform="rotate(122 128 128)"/>
+  <circle cx="128" cy="128" r="20" fill="#4c8dff"/>
+  <circle cx="128" cy="128" r="8" fill="#111520"/>
+</svg>

@@ -1,0 +1,48 @@
+appId: org.partitionforge.app
+productName: PartitionForge
+copyright: Copyright (c) 2026 Hillyard Tech
+
+# Self-update feed: GitHub Releases. tools/publish.sh creates the release
+# with latest.yml, the installer and its blockmap.
+publish:
+  - provider: github
+    owner: tpawley2001
+    repo: partition-forge
+
+directories:
+  buildResources: build
+  output: release
+
+files:
+  - dist/**/*
+  - package.json
+  - "!**/*.map"
+
+# The PowerShell scripts and the offline engine image must stay as real files on
+# disk: PowerShell cannot run a script from inside an asar archive, and the
+# firmware has to read the engine straight off the EFI partition.
+extraResources:
+  - from: resources
+    to: pf
+    filter: ["**/*", "!.build/**"]
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  icon: build/icon.ico
+  # Every disk operation needs an elevated token; asking once at launch beats
+  # failing halfway through a queue.
+  requestedExecutionLevel: requireAdministrator
+  artifactName: ${productName}-Setup-${version}.exe
+
+nsis:
+  oneClick: false
+  perMachine: true
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: PartitionForge
+  license: LICENSE
+  uninstallDisplayName: PartitionForge ${version}
+  include: build/installer.nsh

@@ -1,0 +1,599 @@
+#!/bin/sh
+# ---------------------------------------------------------------------------
+# PartitionForge offline engine.
+#
+# Runs as PID 1 from an initramfs, before any OS has mounted the disks, and
+# carries out the operations Windows refuses to do on a live volume: moving
+# partitions, shrinking past immovable files, rewriting the partition table.
+#
+# It finds its work by scanning every FAT partition for
+# /EFI/PartitionForge/job.json, writes result.json beside it, and reboots.
+# ---------------------------------------------------------------------------
+set -u
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+STAGE=/pf
+LOG=$STAGE/engine.log
+ESP=""
+RESULTS=""
+ABORTED=0
+
+# /dev/console resolves to whichever console= came last on the kernel command
+# line, so writing there alone hides the output on either a headless test rig
+# or a real screen. Write to every console that exists instead.
+CONSOLES=""
+init_consoles() {
+    for c in /dev/tty0 /dev/ttyS0; do [ -c "$c" ] && CONSOLES="$CONSOLES $c"; done
+    [ -n "$CONSOLES" ] || CONSOLES=/dev/console
+}
+say()  { local _c; for _c in $CONSOLES; do printf '%s\n' "$*" > "$_c" 2>/dev/null; done; }
+sayn() { local _c; for _c in $CONSOLES; do printf '%s'   "$*" > "$_c" 2>/dev/null; done; }
+
+log() { say "[pf] $*" ; [ -n "$ESP" ] && echo "$(date '+%H:%M:%S') $*" >> "$LOG" ; }
+fatal() { log "FATAL: $*"; finish 1; }
+
+banner() {
+    say ""
+    say "==========================================================="
+    say "  PartitionForge offline engine"
+    say "  Do not power off this machine."
+    say "==========================================================="
+    say ""
+}
+
+# --------------------------------------------------------------- boot-up
+mount -t proc     proc     /proc    2>/dev/null
+mount -t sysfs    sysfs    /sys     2>/dev/null
+mount -t devtmpfs devtmpfs /dev     2>/dev/null
+mkdir -p /dev/pts && mount -t devpts devpts /dev/pts 2>/dev/null
+mkdir -p "$STAGE"
+
+init_consoles
+banner
+say "Loading storage drivers..."
+
+# No udev in here. Blanket-load everything that could expose a disk; failures
+# are expected and harmless.
+for d in nvme ata scsi usb/storage usb/host virtio block md mmc firewire; do
+    find "/lib/modules/$(uname -r)/kernel/drivers/$d" -name '*.ko*' 2>/dev/null |
+    while read -r m; do modprobe "$(basename "$m" | sed 's/\.ko.*$//')" 2>/dev/null; done
+done
+# nls_cp437 is not optional: without it the kernel refuses to mount the FAT
+# EFI system partition that carries the job.
+for fs in fat vfat nls_cp437 nls_ascii nls_iso8859-1 nls_utf8 mbcache jbd2 ext4 ntfs3 exfat; do
+    modprobe "$fs" 2>/dev/null
+done
+
+# Give asynchronous probes (USB especially) time to enumerate.
+sleep 4
+mdev -s 2>/dev/null
+
+# ---------------------------------------------------------- helpers
+
+# /dev/sda + 1 -> /dev/sda1 ; /dev/nvme0n1 + 1 -> /dev/nvme0n1p1
+partdev() {
+    case "$1" in
+        *[0-9]) echo "$1p$2" ;;
+        *)      echo "$1$2" ;;
+    esac
+}
+
+# PTUUID is the GPT disk GUID on GPT, and the 4-byte MBR signature on MBR --
+# exactly the two values the Windows side recorded.
+disk_id() { blkid -p -o value -s PTUUID "$1" 2>/dev/null | tr 'A-Z' 'a-z'; }
+
+all_disks() {
+    local s n
+    for s in /sys/block/*; do
+        n=$(basename "$s")
+        case "$n" in
+            loop*|ram*|zram*|sr*|fd*|dm-*|md*) continue ;;
+        esac
+        [ -e "/dev/$n" ] || continue
+        # Skip partitions that surface as top-level entries.
+        [ -e "$s/partition" ] && continue
+        echo "/dev/$n"
+    done
+}
+
+# Resolve a job's disk descriptor to a device node, verifying size as a
+# second factor so a cloned identifier cannot send us to the wrong drive.
+resolve_disk() {
+    local want_id want_size dev got sectors bytes match
+    want_id="$1"; want_size="$2"
+    match=""
+    for dev in $(all_disks); do
+        got=$(disk_id "$dev")
+        [ "$got" = "$want_id" ] || continue
+        sectors=$(cat "/sys/block/$(basename "$dev")/size" 2>/dev/null || echo 0)
+        bytes=$((sectors * 512))
+        if [ "$want_size" -gt 0 ] && [ "$bytes" -ne "$want_size" ]; then
+            continue
+        fi
+        # Cloned drives can have identical identifiers AND sizes. Refuse an
+        # ambiguous match instead of silently editing the first drive found.
+        [ -z "$match" ] || return 1
+        match="$dev"
+    done
+    [ -n "$match" ] || return 1
+    echo "$match"
+}
+
+# All partition sysfs dirs of a disk, each listed exactly once.
+part_dirs() {
+    local base p
+    base=$(basename "$1")
+    for p in /sys/block/"$base"/*/; do
+        [ -f "${p}start" ] && echo "$p"
+    done
+}
+
+# Locate the partition whose start offset matches, in bytes.
+resolve_part() {
+    local dev want_off p start
+    dev="$1"; want_off="$2"
+    for p in $(part_dirs "$dev"); do
+        start=$(cat "${p}start")
+        [ $((start * 512)) -eq "$want_off" ] || continue
+        echo "/dev/$(basename "$p")"; return 0
+    done
+    return 1
+}
+
+record() {
+    local id status err esc
+    id="$1"; status="$2"; err="$3"
+    esc=$(jq -cn --arg id "$id" --arg status "$status" --arg error "$err" '{id:$id,status:$status,error:$error}')
+    RESULTS="${RESULTS}${RESULTS:+,}$esc"
+    [ "$status" = "failed" ] && ABORTED=1
+    return 0
+}
+
+# ---------------------------------------------------------- operations
+
+# Chunked raw copy. Direction matters: when the destination overlaps the
+# source, copying the wrong way round overwrites bytes we have not read yet.
+copy_region() {
+    # sh has no function scope by default; without these, a helper
+    # would overwrite the caller's loop counters.
+    local dev src dst len chunk total i off n pct distance
+    dev="$1"; src="$2"; dst="$3"; len="$4"
+    chunk=$((16 * 1024 * 1024))
+    [ "$src" -eq "$dst" ] && return 0
+    # dd streams each chunk in smaller buffers. A chunk must never overlap
+    # its own source, even when chunks themselves are traversed backwards.
+    distance=$((dst - src)); [ "$distance" -lt 0 ] && distance=$((-distance))
+    [ "$chunk" -gt "$distance" ] && chunk=$distance
+    total=$(( (len + chunk - 1) / chunk ))
+    i=0
+    if [ "$dst" -gt "$src" ]; then
+        # Moving right: copy the tail first.
+        i=$((total - 1))
+        while [ "$i" -ge 0 ]; do
+            off=$((i * chunk))
+            # The tail chunk is usually short; asking dd for a full chunk would
+            # write zeros past the end of the region.
+            n=$((len - off)); [ "$n" -gt "$chunk" ] && n=$chunk
+            dd if="$dev" of="$dev" bs=1M iflag=fullblock,skip_bytes,count_bytes oflag=seek_bytes conv=notrunc \
+               skip=$((src + off)) seek=$((dst + off)) count=$n 2>/dev/null || return 1
+            pct=$(( (total - i) * 100 / total ))
+            sayn "  copying ${pct}%  "
+            i=$((i - 1))
+        done
+    else
+        while [ "$i" -lt "$total" ]; do
+            off=$((i * chunk))
+            n=$((len - off)); [ "$n" -gt "$chunk" ] && n=$chunk
+            dd if="$dev" of="$dev" bs=1M iflag=fullblock,skip_bytes,count_bytes oflag=seek_bytes conv=notrunc \
+               skip=$((src + off)) seek=$((dst + off)) count=$n 2>/dev/null || return 1
+            pct=$(( (i + 1) * 100 / total ))
+            sayn "  copying ${pct}%  "
+            i=$((i + 1))
+        done
+    fi
+    say "  copying 100%"
+    sync
+    return 0
+}
+
+fs_of() { blkid -p -o value -s TYPE "$1" 2>/dev/null; }
+
+# Recheck destinations against the table at boot, including neighbours that
+# may have changed since Windows staged the job.
+valid_geometry() {
+    local dev start size ignore bytes
+    dev="$1"; start="$2"; size="$3"; ignore="$4"
+    bytes=$(blockdev --getsize64 "$dev") || return 1
+    sfdisk --json "$dev" 2>/dev/null | jq -e \
+        --argjson start "$start" --argjson size "$size" --arg ignore "$ignore" --argjson bytes "$bytes" '
+        .partitiontable | .sectorsize as $sector |
+        ($start >= 1048576 and $size >= 1048576 and $start % $sector == 0 and $size % $sector == 0) and
+        ($start + $size <= ((.lastlba // ($bytes / $sector - 1)) + 1) * $sector) and
+        all(.partitions[]?; .node == $ignore or
+            $start >= (.start + .size) * $sector or $start + $size <= .start * $sector)
+    ' >/dev/null
+}
+
+# Shrink the filesystem to fit `bytes`, before the partition itself shrinks.
+shrink_fs() {
+    local part bytes
+    part="$1"; bytes="$2"
+    case "$(fs_of "$part")" in
+        ntfs)
+            # ntfsresize wants a size in bytes and a confirmation.
+            # Keep its dirty/hibernation checks: do not clear flags to force
+            # writes to a filesystem Windows has not shut down cleanly.
+            printf 'y\n' | ntfsresize --size "$bytes" "$part" || return 1
+            ;;
+        ext2|ext3|ext4)
+            e2fsck -fy "$part" >/dev/null 2>&1
+            [ "$?" -le 1 ] || return 1
+            resize2fs "$part" "$((bytes / 1024))K" || return 1
+            ;;
+        vfat|exfat)
+            log "  $(fs_of "$part") cannot be shrunk in place; partition boundary only"
+            return 1
+            ;;
+        *) log "  unrecognised filesystem; refusing to truncate data"; return 1 ;;
+    esac
+    sync
+    return 0
+}
+
+# Grow the filesystem into the space the partition just gained.
+grow_fs() {
+    local part
+    part="$1"
+    case "$(fs_of "$part")" in
+        ntfs)
+            printf 'y\n' | ntfsresize "$part" || return 1
+            ;;
+        ext2|ext3|ext4)
+            e2fsck -fy "$part" >/dev/null 2>&1
+            [ "$?" -le 1 ] || return 1
+            resize2fs "$part" || return 1
+            ;;
+        *) log "  filesystem cannot be grown automatically; partition enlarged only" ;;
+    esac
+    sync
+    return 0
+}
+
+# Rewrite one partition's start/size in the table, leaving the rest intact.
+# The entry is matched by device name, not by line position: sfdisk --dump
+# lists partitions in table order, which is not necessarily offset order.
+set_part_geometry() {
+    local dev index start_b size_b tmp
+    dev="$1"; index="$2"; start_b="$3"; size_b="$4"
+    tmp=$STAGE/table.sfdisk
+    sfdisk --dump "$dev" > "$tmp" 2>/dev/null || return 1
+    awk -v want="$(partdev "$dev" "$index")" -v st="$((start_b / 512))" -v sz="$((size_b / 512))" '
+        /^[^ ]+[0-9]+ *:/ {
+            line = $0
+            sub(/[ \t]*:.*/, "", line)
+            if (line == want) {
+                line = $0
+                sub(/start=[ ]*[0-9]+/, "start=" st, line)
+                sub(/size=[ ]*[0-9]+/,  "size="  sz, line)
+                print line
+                next
+            }
+        }
+        { print }
+    ' "$tmp" > "$tmp.new" || return 1
+    sfdisk --no-reread --no-tell-kernel --force "$dev" < "$tmp.new" >/dev/null 2>&1 || return 1
+    # BLKRRPART fails while the ESP on this disk is mounted. Update only the
+    # unmounted target partition so subsequent ops see its actual new size.
+    partx --update --nr "$index" "$dev" 2>/dev/null || return 1
+    sleep 1
+    return 0
+}
+
+# The kernel's partition number at a byte offset — what sfdisk and partdev
+# both expect — read from sysfs rather than inferred from dump order.
+part_index_at() {
+    local dev off p start
+    dev="$1"; off="$2"
+    for p in $(part_dirs "$dev"); do
+        start=$(cat "${p}start")
+        [ $((start * 512)) -eq "$off" ] || continue
+        basename "$p" | sed "s/^$(basename "$dev")p\?//"
+        return 0
+    done
+    return 1
+}
+
+do_resize() {
+    local dev part idx old_off old_size new_off new_size newpart copy_size
+    dev="$1"; part="$2"; idx="$3"; old_off="$4"; old_size="$5"; new_off="$6"; new_size="$7"
+
+    if [ "$new_off" != "$old_off" ]; then
+        # A resize that also moves the start: shrink the filesystem first if
+        # needed, relocate, then re-establish the table entry.
+        if [ "$new_size" -lt "$old_size" ]; then
+            shrink_fs "$part" "$new_size" || return 1
+        fi
+        copy_size=$old_size
+        [ "$new_size" -lt "$copy_size" ] && copy_size=$new_size
+        copy_region "$dev" "$old_off" "$new_off" "$copy_size" || return 1
+        set_part_geometry "$dev" "$idx" "$new_off" "$new_size" || return 1
+        newpart=$(resolve_part "$dev" "$new_off") || return 1
+        [ "$new_size" -gt "$old_size" ] && { grow_fs "$newpart" || return 1; }
+        return 0
+    fi
+
+    if [ "$new_size" -lt "$old_size" ]; then
+        shrink_fs "$part" "$new_size" || return 1
+        set_part_geometry "$dev" "$idx" "$new_off" "$new_size" || return 1
+    else
+        set_part_geometry "$dev" "$idx" "$new_off" "$new_size" || return 1
+        newpart=$(resolve_part "$dev" "$new_off") || return 1
+        grow_fs "$newpart" || return 1
+    fi
+    return 0
+}
+
+do_move() {
+    local dev idx old_off size new_off
+    dev="$1"; idx="$2"; old_off="$3"; size="$4"; new_off="$5"
+    copy_region "$dev" "$old_off" "$new_off" "$size" || return 1
+    set_part_geometry "$dev" "$idx" "$new_off" "$size" || return 1
+    return 0
+}
+
+do_convert() {
+    local dev to
+    dev="$1"; to="$2"
+    case "$to" in
+        GPT) sgdisk --mbrtogpt "$dev" >/dev/null 2>&1 || sgdisk -g "$dev" >/dev/null 2>&1 || return 1 ;;
+        MBR)
+            # gdisk's recovery menu: 'r' -> 'g' (convert to MBR) -> 'w' (write).
+            printf 'r\ng\nw\nY\n' | gdisk "$dev" >/dev/null 2>&1 || return 1 ;;
+        *) return 1 ;;
+    esac
+    partx --update "$dev" 2>/dev/null || return 1
+    return 0
+}
+
+do_wipe() {
+    local part passes n src bytes
+    part="$1"; passes="$2"
+    bytes=$(blockdev --getsize64 "$part") || return 1
+    n=1
+    while [ "$n" -le "$passes" ]; do
+        say "  pass $n/$passes"
+        if [ "$n" -eq "$passes" ]; then src=/dev/zero; else src=/dev/urandom; fi
+        dd if="$src" of="$part" bs=4M iflag=fullblock,count_bytes count="$bytes" conv=notrunc 2>/dev/null || return 1
+        sync
+        n=$((n + 1))
+    done
+    return 0
+}
+
+# sfdisk --append adds one entry without disturbing the others, which matters:
+# rewriting the whole table would renumber partitions the queue still refers to.
+do_create() {
+    local dev start_b size_b fs label typecode line
+    dev="$1"; start_b="$2"; size_b="$3"; fs="$4"; label="$5"; typecode="$6"
+    line="start=$((start_b / 512)), size=$((size_b / 512))"
+    [ -n "$typecode" ] && line="$line, type=$typecode"
+    echo "$line" | sfdisk --append --no-reread --no-tell-kernel --force "$dev" >/dev/null 2>&1 || return 1
+    partx --update "$dev" 2>/dev/null || return 1
+    sleep 1
+    local newpart
+    newpart=$(resolve_part "$dev" "$start_b") || return 1
+    if [ -n "$fs" ] && [ "$fs" != "unformatted" ]; then
+        do_format "$newpart" "$fs" "$label" || return 1
+    fi
+    return 0
+}
+
+do_delete() {
+    local dev idx
+    dev="$1"; idx="$2"
+    sfdisk --delete --no-reread --no-tell-kernel "$dev" "$idx" >/dev/null 2>&1 || return 1
+    partx --delete --nr "$idx" "$dev" 2>/dev/null || return 1
+    return 0
+}
+
+do_label() {
+    local part label
+    part="$1"; label="$2"
+    case "$(fs_of "$part")" in
+        ntfs)       ntfslabel "$part" "$label" >/dev/null 2>&1 || return 1 ;;
+        vfat|msdos) fatlabel  "$part" "$(echo "$label" | cut -c1-11)" >/dev/null 2>&1 || return 1 ;;
+        exfat)      exfatlabel "$part" "$(echo "$label" | cut -c1-15)" >/dev/null 2>&1 || return 1 ;;
+        ext2|ext3|ext4) e2label "$part" "$label" >/dev/null 2>&1 || return 1 ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+do_set_active() {
+    local dev idx
+    dev="$1"; idx="$2"
+    sfdisk --activate "$dev" "$idx" >/dev/null 2>&1 || return 1
+    return 0
+}
+
+do_format() {
+    local part fs label
+    part="$1"; fs="$2"; label="$3"
+    case "$fs" in
+        FAT32) mkfs.vfat -F 32 -n "$(echo "$label" | cut -c1-11)" "$part" >/dev/null 2>&1 || return 1 ;;
+        exFAT) mkfs.exfat -n "$(echo "$label" | cut -c1-15)" "$part" >/dev/null 2>&1 || return 1 ;;
+        NTFS)  mkfs.ntfs -Q -L "$label" "$part" >/dev/null 2>&1 || return 1 ;;
+        ext4)  mkfs.ext4 -F -L "$label" "$part" >/dev/null 2>&1 || return 1 ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+# ---------------------------------------------------------- finish
+
+finish() {
+    local code
+    code="${1:-0}"
+    [ "$code" -eq 0 ] || ABORTED=1
+    if [ -n "$ESP" ]; then
+        cat > "$STAGE/esp/EFI/PartitionForge/result.json" <<EOF
+{"version":1,"completedAt":"$(date -u '+%Y-%m-%dT%H:%M:%SZ')","aborted":$ABORTED,"results":[$RESULTS]}
+EOF
+        # Removing the job is what stops this engine running again next boot.
+        rm -f "$STAGE/esp/EFI/PartitionForge/job.json"
+        sync
+        umount "$STAGE/esp" 2>/dev/null
+    fi
+    sync
+    say ""
+    if [ "$ABORTED" -eq 0 ] && [ "$code" -eq 0 ]; then
+        say "All operations completed. Restarting into Windows..."
+    else
+        say "Finished with errors. Details will be shown in PartitionForge."
+    fi
+    sleep 5
+    # BootNext was consumed by the firmware, so this returns to the normal order.
+    reboot -f
+    while : ; do sleep 60; done
+}
+
+# ---------------------------------------------------------- main
+
+say "Scanning for staged work..."
+mkdir -p "$STAGE/esp"
+for dev in $(all_disks); do
+    for p in $(part_dirs "$dev"); do
+        cand="/dev/$(basename "$p")"
+        [ -b "$cand" ] || continue
+        case "$(fs_of "$cand")" in vfat|msdos) ;; *) continue ;; esac
+        mount -t vfat "$cand" "$STAGE/esp" 2>/dev/null || continue
+        if [ -f "$STAGE/esp/EFI/PartitionForge/job.json" ]; then
+            ESP="$cand"
+            LOG="$STAGE/esp/EFI/PartitionForge/engine.log"
+            log "found staged job on $cand"
+            break 2
+        fi
+        umount "$STAGE/esp" 2>/dev/null
+    done
+done
+
+[ -n "$ESP" ] || { say "No staged work found. Restarting..."; sleep 3; reboot -f; }
+
+JOB="$STAGE/esp/EFI/PartitionForge/job.json"
+COUNT=$(jq -r '.operations | length' "$JOB" 2>/dev/null || echo 0)
+[ "$COUNT" -gt 0 ] 2>/dev/null || fatal "job.json contains no operations"
+
+log "executing $COUNT operation(s)"
+echo
+i=0
+while [ "$i" -lt "$COUNT" ]; do
+    OP=$(jq -c ".operations[$i]" "$JOB")
+    ID=$(echo "$OP"      | jq -r '.id')
+    KIND=$(echo "$OP"    | jq -r '.kind')
+    DESC=$(echo "$OP"    | jq -r '.description')
+    D_ID=$(echo "$OP"    | jq -r '.disk.id // ""' | tr 'A-Z' 'a-z')
+    D_SIZE=$(echo "$OP"  | jq -r '.disk.size // 0')
+    P_OFF=$(echo "$OP"   | jq -r '.partition.offset // 0')
+    P_SIZE=$(echo "$OP"  | jq -r '.partition.size // 0')
+
+    i=$((i + 1))
+    say "[$i/$COUNT] $DESC"
+
+    if [ "$ABORTED" -eq 1 ]; then
+        record "$ID" "pending" "Skipped: an earlier operation failed."
+        say "  skipped"
+        continue
+    fi
+
+    DEV=$(resolve_disk "$D_ID" "$D_SIZE") || {
+        record "$ID" "failed" "Could not find the disk with identifier $D_ID."
+        say "  FAILED: disk not found"; continue
+    }
+    log "  disk $D_ID -> $DEV"
+
+    PART=""
+    IDX=""
+    if [ "$P_OFF" -gt 0 ]; then
+        PART=$(resolve_part "$DEV" "$P_OFF") || true
+        IDX=$(part_index_at "$DEV" "$P_OFF")
+        ACTUAL_SIZE=$(blockdev --getsize64 "$PART" 2>/dev/null || echo 0)
+        if [ "$ACTUAL_SIZE" -ne "$P_SIZE" ]; then
+            record "$ID" "failed" "Partition geometry changed since the job was staged."
+            continue
+        fi
+    fi
+    # sfdisk geometry below uses 512-byte sectors. Refuse 4Kn rather than
+    # interpreting byte offsets as the wrong sector units.
+    SECTOR_SIZE=$(blockdev --getss "$DEV")
+    if [ "$SECTOR_SIZE" -ne 512 ]; then
+        record "$ID" "failed" "Offline operations require 512-byte logical sectors."
+        continue
+    fi
+    if [ -n "$PART" ] && [ "$PART" = "$ESP" ]; then
+        record "$ID" "failed" "Cannot modify the EFI partition carrying the active job."
+        continue
+    fi
+
+    OK=0
+    case "$KIND" in
+        resize)
+            NEW_SIZE=$(echo "$OP" | jq -r '.params.newSize')
+            NEW_OFF=$(echo "$OP"  | jq -r ".params.newOffset // $P_OFF")
+            [ -n "$IDX" ] || { record "$ID" "failed" "Partition at offset $P_OFF not found in the table."; say "  FAILED"; continue; }
+            valid_geometry "$DEV" "$NEW_OFF" "$NEW_SIZE" "$PART" || { record "$ID" "failed" "Unsafe resize destination geometry."; continue; }
+            do_resize "$DEV" "$PART" "$IDX" "$P_OFF" "$P_SIZE" "$NEW_OFF" "$NEW_SIZE" && OK=1 ;;
+        move)
+            NEW_OFF=$(echo "$OP" | jq -r '.params.newOffset')
+            [ -n "$IDX" ] || { record "$ID" "failed" "Partition at offset $P_OFF not found in the table."; say "  FAILED"; continue; }
+            valid_geometry "$DEV" "$NEW_OFF" "$P_SIZE" "$PART" || { record "$ID" "failed" "Unsafe move destination geometry."; continue; }
+            do_move "$DEV" "$IDX" "$P_OFF" "$P_SIZE" "$NEW_OFF" && OK=1 ;;
+        convertTable)
+            TO=$(echo "$OP" | jq -r '.params.to')
+            do_convert "$DEV" "$TO" && OK=1 ;;
+        wipe)
+            PASSES=$(echo "$OP" | jq -r '.params.passes // 1')
+            [ -n "$PART" ] || { record "$ID" "failed" "Partition not found."; say "  FAILED"; continue; }
+            do_wipe "$PART" "$PASSES" && OK=1 ;;
+        format)
+            FS=$(echo "$OP"    | jq -r '.params.fileSystem')
+            LABEL=$(echo "$OP" | jq -r '.params.label // ""')
+            [ -n "$PART" ] || { record "$ID" "failed" "Partition not found."; say "  FAILED"; continue; }
+            do_format "$PART" "$FS" "$LABEL" && OK=1 ;;
+        create)
+            C_OFF=$(echo "$OP"   | jq -r '.params.offset')
+            C_SIZE=$(echo "$OP"  | jq -r '.params.size')
+            C_FS=$(echo "$OP"    | jq -r '.params.fileSystem // ""')
+            C_LABEL=$(echo "$OP" | jq -r '.params.label // ""')
+            C_TYPE=$(echo "$OP"  | jq -r '.params.typeCode // ""')
+            valid_geometry "$DEV" "$C_OFF" "$C_SIZE" "" || { record "$ID" "failed" "Unsafe create destination geometry."; continue; }
+            do_create "$DEV" "$C_OFF" "$C_SIZE" "$C_FS" "$C_LABEL" "$C_TYPE" && OK=1 ;;
+        delete)
+            [ -n "$IDX" ] || { record "$ID" "failed" "Partition at offset $P_OFF not found in the table."; say "  FAILED"; continue; }
+            do_delete "$DEV" "$IDX" && OK=1 ;;
+        label)
+            L_LABEL=$(echo "$OP" | jq -r '.params.label // ""')
+            [ -n "$PART" ] || { record "$ID" "failed" "Partition not found."; say "  FAILED"; continue; }
+            do_label "$PART" "$L_LABEL" && OK=1 ;;
+        setActive)
+            [ -n "$IDX" ] || { record "$ID" "failed" "Partition at offset $P_OFF not found in the table."; say "  FAILED"; continue; }
+            do_set_active "$DEV" "$IDX" && OK=1 ;;
+        *)
+            record "$ID" "failed" "The offline engine does not implement '$KIND'."
+            say "  FAILED: unsupported"; continue ;;
+    esac
+
+    if [ "$OK" -eq 1 ]; then
+        record "$ID" "done" ""
+        say "  done"
+        log "  $KIND ok"
+    else
+        record "$ID" "failed" "The $KIND operation reported an error. See engine.log on the EFI partition."
+        say "  FAILED"
+        log "  $KIND FAILED"
+    fi
+    sync
+done
+
+finish 0
