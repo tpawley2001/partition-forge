@@ -1,6 +1,6 @@
 import type { Disk, Operation } from '../../shared/types';
 
-const kinds = new Set(['resize', 'move', 'create', 'delete', 'format', 'label', 'letter', 'setActive', 'convertTable', 'wipe']);
+const kinds = new Set(['resize', 'move', 'create', 'delete', 'format', 'label', 'letter', 'setActive', 'convertTable', 'wipe', 'formatDisk']);
 const record = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 const integer = (v: unknown, min = 0): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= min;
 const letter = (v: unknown) => v === null || (typeof v === 'string' && /^[A-Z]$/.test(v));
@@ -18,7 +18,7 @@ export function validateOperations(input: unknown): asserts input is Operation[]
       || !record(op.target) || !integer(op.target.diskNumber) || !record(op.params)) fail();
     const { kind, target: t, params: p } = op as Operation;
     ids.add(op.id);
-    const expected = kind === 'create' ? 'free' : kind === 'convertTable' ? 'disk' : 'partition';
+    const expected = kind === 'create' ? 'free' : kind === 'convertTable' || kind === 'formatDisk' ? 'disk' : 'partition';
     if (t.kind !== expected || (t.kind === 'partition' && !integer(t.partitionNumber, 1))
       || (t.kind === 'free' && (!integer(t.offset) || !integer(t.size, 1)))) fail();
     const prm = p as Record<string, unknown>;
@@ -39,6 +39,10 @@ export function validateOperations(input: unknown): asserts input is Operation[]
       case 'letter': if (!letter(prm.driveLetter)) fail(); break;
       case 'convertTable': if (prm.to !== 'GPT' && prm.to !== 'MBR') fail(); break;
       case 'wipe': if (!integer(prm.passes, 1) || prm.passes > 7) fail(); break;
+      case 'formatDisk':
+        if (!['FAT32', 'exFAT', 'NTFS'].includes(prm.fileSystem as string) || !label(prm.label)
+          || (prm.table !== 'MBR' && prm.table !== 'GPT')) fail();
+        break;
     }
   }
 }

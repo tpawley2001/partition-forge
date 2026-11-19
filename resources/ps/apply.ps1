@@ -116,6 +116,69 @@ function Invoke-Op {
             }
         }
 
+        'formatDisk' {
+            # Whole-disk format for SD cards and USB sticks: clear the table,
+            # write a fresh one with a single partition at 4 MiB, format it.
+            $n = [int]$t.diskNumber
+            $fs = [string]$p.fileSystem
+            $table = [string]$p.table
+            $label = [string]$p.label
+            $disk = Get-Disk -Number $n -ErrorAction Stop
+            if ($disk.IsSystem -or $disk.IsBoot) { throw "Disk $n holds the running system; refusing to format it." }
+            if ($disk.IsReadOnly) { throw "Disk $n is write-protected. Check the lock switch on the card or adapter." }
+
+            if ($disk.PartitionStyle -ne 'RAW') {
+                Write-Progress-Line 10 "Clearing disk $n"
+                Clear-Disk -Number $n -RemoveData -RemoveOEM -Confirm:$false -ErrorAction Stop
+            }
+            $disk = Get-Disk -Number $n -ErrorAction Stop
+            if ($disk.PartitionStyle -eq 'RAW') {
+                Initialize-Disk -Number $n -PartitionStyle $table -ErrorAction Stop | Out-Null
+            } elseif ($disk.PartitionStyle -ne $table) {
+                Set-Disk -Number $n -PartitionStyle $table -ErrorAction Stop
+            }
+            # Initialize-Disk on GPT adds a Microsoft Reserved partition on
+            # fixed disks; a card holds just the one data partition.
+            Get-Partition -DiskNumber $n -ErrorAction SilentlyContinue |
+                Where-Object { $_.GptType -eq '{e3c9e316-0b5c-4db8-817d-f92df00215ae}' } |
+                Remove-Partition -Confirm:$false -ErrorAction SilentlyContinue
+
+            $partArgs = @{ DiskNumber = $n; Offset = 4MB; UseMaximumSize = $true; ErrorAction = 'Stop' }
+            if ($table -eq 'MBR') { $partArgs['MbrType'] = $(if ($fs -eq 'FAT32') { 12 } else { 7 }) }
+            Write-Progress-Line 30 "Creating the partition"
+            $newPart = New-Partition @partArgs
+
+            Write-Progress-Line 50 "Formatting as $fs"
+            if ($fs -eq 'FAT32' -and [int64]$newPart.Size -gt 32GB) {
+                . (Join-Path $PSScriptRoot 'fat32.ps1')
+                # Keep Explorer off the raw volume while it is being written.
+                $letter = $null
+                $volPath = $null
+                for ($i = 0; $i -lt 40 -and -not $volPath; $i++) {
+                    $cur = Get-Partition -DiskNumber $n -PartitionNumber $newPart.PartitionNumber -ErrorAction Stop
+                    $letter = Get-LetterOrNull $cur.DriveLetter
+                    $volPath = @($cur.AccessPaths) | Where-Object { $_ -like '\\?\Volume*' } | Select-Object -First 1
+                    if (-not $volPath) { Start-Sleep -Milliseconds 500 }
+                }
+                if (-not $volPath) { throw "Windows did not expose a volume for the new partition." }
+                if ($letter) {
+                    Remove-PartitionAccessPath -DiskNumber $n -PartitionNumber $newPart.PartitionNumber `
+                                               -AccessPath ("{0}:\" -f $letter) -ErrorAction SilentlyContinue
+                }
+                [void][PartitionForge.Fat32Formatter]::Format($volPath.TrimEnd('\'), $label, [int64]$newPart.Size, 32768)
+            } else {
+                $fmt = @{ Partition = $newPart; FileSystem = $fs; Confirm = $false; Force = $true; ErrorAction = 'Stop' }
+                if ($label) { $fmt['NewFileSystemLabel'] = $label }
+                Format-Volume @fmt | Out-Null
+            }
+
+            # Removable media normally gets a letter on its own; make sure.
+            $cur = Get-Partition -DiskNumber $n -PartitionNumber $newPart.PartitionNumber -ErrorAction Stop
+            if (-not (Get-LetterOrNull $cur.DriveLetter)) {
+                try { Add-PartitionAccessPath -DiskNumber $n -PartitionNumber $newPart.PartitionNumber -AssignDriveLetter -ErrorAction Stop } catch { }
+            }
+        }
+
         default { throw "Operation '$($Op.kind)' is not executable by the online engine." }
     }
 }

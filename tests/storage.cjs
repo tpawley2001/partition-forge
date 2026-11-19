@@ -122,3 +122,36 @@ test('staging failure preserves online completion status for review', async () =
     assert.match(result.message, /some changes may already have completed/);
   } finally { ps.runScript = originalRun; paths.offlineAssetDir = originalDir; }
 });
+test('whole-disk format replaces every partition with one at 4 MiB', () => {
+  const operation = op('formatDisk', { fileSystem: 'exFAT', label: 'CARD', table: 'MBR' }, { target: { kind: 'disk', diskNumber: 0 } });
+  const p = plan(operation);
+  assert.deepEqual(p.blockers, []);
+  assert.equal(p.operations[0].engine, 'online');
+  assert.ok(p.warnings.some(w => w.severity === 'danger'));
+  const after = simulate([disk()], [operation])[0];
+  assert.equal(after.partitionStyle, 'MBR');
+  assert.equal(after.partitions.length, 1);
+  assert.equal(after.partitions[0].offset, 4 * MIB);
+  assert.equal(after.partitions[0].offset + after.partitions[0].size, 2048 * MIB);
+  assert.equal(after.partitions[0].volume.fileSystem, 'exFAT');
+});
+test('whole-disk format refuses the system disk, bad params and offline queues', () => {
+  const fd = (params, extra = {}) => op('formatDisk', { fileSystem: 'FAT32', label: '', table: 'MBR', ...params },
+    { target: { kind: 'disk', diskNumber: 0 }, ...extra });
+  let d = disk(); d.isSystem = true;
+  assert.ok(plan(fd({}), d).blockers.length);
+  d = disk(); d.isBoot = true;
+  assert.ok(plan(fd({}), d).blockers.length);
+  assert.ok(plan(fd({ fileSystem: 'ReFS' })).blockers.length);
+  assert.ok(plan(fd({ table: 'APM' })).blockers.length);
+  assert.ok(plan(fd({ label: 'TWELVE CHARS' })).blockers.length);
+  assert.ok(plan(fd({}, { target: { kind: 'partition', diskNumber: 0, partitionNumber: 1 } })).blockers.length);
+  // Behind an offline move on the same disk it would be deferred, which is unsupported.
+  const queue = [op('move', { newOffset: 1535 * MIB }, { target: { kind: 'partition', diskNumber: 0, partitionNumber: 2 } }), fd({}, { id: 'op-2' })];
+  assert.ok(planOperations([disk()], queue).blockers.some(b => /whole-disk format/.test(b)));
+});
+test('whole-disk format works on a disk with no partition table', () => {
+  const d = disk(); d.partitionStyle = 'RAW'; d.partitions = []; d.free = computeFreeRegions(d);
+  const p = plan(op('formatDisk', { fileSystem: 'FAT32', label: 'SD', table: 'MBR' }, { target: { kind: 'disk', diskNumber: 0 } }), d);
+  assert.deepEqual(p.blockers, []);
+});

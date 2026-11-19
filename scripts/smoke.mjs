@@ -88,7 +88,7 @@ try {
 
   console.log('\n1. initial view');
   const diskCount = await evaluate(`document.querySelectorAll('.disk').length`);
-  check('all four sample disks render', diskCount === 4, `got ${diskCount}`);
+  check('all five sample disks render', diskCount === 5, `got ${diskCount}`);
   const segs = await evaluate(`document.querySelectorAll('.seg').length`);
   check('disk map draws segments', segs >= 12, `got ${segs}`);
   // Guards a real regression: a generic .row flex utility once matched the
@@ -202,7 +202,45 @@ try {
   check('delete stays disabled until confirmed', delDisabled === true);
   await shot('08-delete-guard');
 
-  console.log('\n8. sample data cannot invoke destructive system actions');
+  console.log('\n8. whole-disk format of the SD card');
+  await evaluate(`(() => { const b = [...document.querySelectorAll('.dlg .foot button')][0]; b && b.click(); return 'ok'; })()`);
+  await sleep(300);
+  check('select C:', await evaluate(clickText('tr.row', 'C: Windows')) === 'ok');
+  await sleep(300);
+  const fdSystem = await evaluate(`([...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Format Disk')||{}).disabled`);
+  check('Format Disk is disabled on the system disk', fdSystem === true);
+  check('select the SD card', await evaluate(clickText('tr.row', 'H: CAMERA')) === 'ok');
+  await sleep(300);
+  check('open Format Disk', await evaluate(clickText('button', 'Format Disk')) === 'ok');
+  await sleep(500);
+  const fdDefault = await evaluate(`[...document.querySelectorAll('.dlg select')].map(s => s.value).join('/')`);
+  check('SDXC card defaults to exFAT on MBR', fdDefault === 'exFAT/MBR', fdDefault);
+  const fdGuard = await evaluate(`([...document.querySelectorAll('.dlg .foot button')].pop()||{}).disabled`);
+  check('format stays disabled until confirmed', fdGuard === true);
+  await evaluate(`(() => {
+    const set = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    const sel = document.querySelector('.dlg select');
+    Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value').set.call(sel, 'FAT32');
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+    const inputs = [...document.querySelectorAll('.dlg input[type=text]')];
+    set.call(inputs[0], 'GOPRO'); inputs[0].dispatchEvent(new Event('input', { bubbles: true }));
+    set.call(inputs[1], 'format'); inputs[1].dispatchEvent(new Event('input', { bubbles: true }));
+    return 'ok';
+  })()`);
+  await sleep(300);
+  await shot('09-format-disk-dialog');
+  check('queue the whole-disk format', await evaluate(clickText('.dlg .foot button', 'Add to queue')) === 'ok');
+  await sleep(1200);
+  const sd = await evaluate(`(() => {
+    const d = [...document.querySelectorAll('.disk')].find(x => x.textContent.includes('SD/MMC'));
+    return { rows: d.querySelectorAll('tbody tr').length, text: d.textContent };
+  })()`);
+  check('SD card previews as one FAT32 volume', sd.rows === 1 && /GOPRO/.test(sd.text) && /FAT32/.test(sd.text), `${sd.rows} rows`);
+  const sd2 = await evaluate(`document.querySelector('.side').textContent`);
+  check('queue notes the >32 GB FAT32 path', /32 GB/.test(sd2));
+  await shot('10-format-disk-queued');
+
+  console.log('\n9. sample data cannot invoke destructive system actions');
   const applyError = await evaluate(`window.pf.apply([]).then(() => '', e => e.message)`);
   check('sample mode refuses apply in the main process', /read-only/.test(applyError));
   const rebootError = await evaluate(`window.pf.reboot().then(() => '', e => e.message)`);

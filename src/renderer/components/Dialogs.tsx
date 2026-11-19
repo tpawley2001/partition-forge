@@ -450,3 +450,76 @@ export function WipeDialog({ part, onClose, onConfirm }: {
     </Dialog>
   );
 }
+
+/* ------------------------------------------------------- whole-disk format */
+
+export interface FormatDiskResult { fileSystem: 'FAT32' | 'exFAT' | 'NTFS'; label: string; table: 'MBR' | 'GPT' }
+
+const LABEL_MAX: Record<FormatDiskResult['fileSystem'], number> = { FAT32: 11, exFAT: 15, NTFS: 32 };
+
+export function FormatDiskDialog({ disk, onClose, onConfirm }: {
+  disk: Disk; onClose: () => void; onConfirm: (r: FormatDiskResult) => void;
+}) {
+  // SD Association rule: SDHC (up to 32 GB) ships FAT32, SDXC (over 32 GB) exFAT.
+  const [fileSystem, setFs] = useState<FormatDiskResult['fileSystem']>(disk.size <= 32 * GIB ? 'FAT32' : 'exFAT');
+  const [table, setTable] = useState<FormatDiskResult['table']>(disk.size > 2 * 1024 * GIB ? 'GPT' : 'MBR');
+  const [label, setLabel] = useState('');
+  const [text, setText] = useState('');
+  const max = LABEL_MAX[fileSystem];
+  const used = disk.partitions.reduce((n, p) => n + (p.volume ? p.volume.size - p.volume.sizeRemaining : 0), 0);
+  const removable = ['USB', 'SD', 'MMC'].includes(disk.busType) || disk.mediaType === 'Unspecified';
+  const name = disk.friendlyName || `Disk ${disk.number}`;
+
+  return (
+    <Dialog title={`Format whole disk ${disk.number}`} onClose={onClose} confirmDanger
+            disabled={text.trim().toUpperCase() !== 'FORMAT' || label.length > max}
+            onConfirm={() => onConfirm({ fileSystem, table, label })}>
+      <div className="note danger">
+        <span>
+          Everything on <b>{name}</b> ({fmt(disk.size)}) is erased: {disk.partitions.length
+            ? `${disk.partitions.length} partition(s)${used ? `, ${fmt(used)} of data` : ''}`
+            : 'the whole disk'}. It ends up with one partition filling the disk. There is no undo.
+        </span>
+      </div>
+      {!removable && (
+        <div className="note danger">
+          <span>This does not look like an SD card or USB stick ({disk.busType}). Make sure it is the disk you mean.</span>
+        </div>
+      )}
+      <div className="frow">
+        <div className="field">
+          <label>File system</label>
+          <select value={fileSystem} onChange={(e) => setFs(e.target.value as FormatDiskResult['fileSystem'])}>
+            <option value="FAT32">FAT32</option>
+            <option value="exFAT">exFAT</option>
+            <option value="NTFS">NTFS</option>
+          </select>
+        </div>
+        <div className="field">
+          <label>Partition table</label>
+          <select value={table} onChange={(e) => setTable(e.target.value as FormatDiskResult['table'])}>
+            <option value="MBR">MBR</option>
+            <option value="GPT">GPT</option>
+          </select>
+        </div>
+      </div>
+      <div className="field"><div className="hint">
+        {fileSystem === 'FAT32' && disk.size > 32 * GIB
+          ? 'FAT32 over 32 GB: for cameras, consoles and printers that read nothing else. Windows will not format this; PartitionForge writes it itself. Files are limited to 4 GB each.'
+          : fileSystem === 'FAT32' ? 'The SD-card standard up to 32 GB. Reads almost anywhere; files are limited to 4 GB each.'
+          : fileSystem === 'exFAT' ? 'The SD-card standard over 32 GB. Works on Windows, macOS, Linux, Android and most cameras.'
+          : 'Windows only for writing. Most cameras, TVs and consoles cannot read it.'}
+        {' '}MBR suits almost every device; GPT is needed only above 2 TB.
+      </div></div>
+      <div className="field">
+        <label>Volume label</label>
+        <input type="text" value={label} maxLength={max} onChange={(e) => setLabel(e.target.value)} />
+        <div className="hint">{fileSystem} labels hold up to {max} characters.</div>
+      </div>
+      <div className="field">
+        <label>Type <span className="mono">FORMAT</span> to confirm</label>
+        <input type="text" value={text} autoFocus onChange={(e) => setText(e.target.value)} />
+      </div>
+    </Dialog>
+  );
+}

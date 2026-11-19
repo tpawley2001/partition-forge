@@ -5,7 +5,7 @@ import { DiskCard } from './components/DiskCard';
 import type { Selection } from './components/DiskMap';
 import { OpQueue } from './components/OpQueue';
 import {
-  ConfirmDialog, ConvertDialog, CreateDialog, FormatDialog,
+  ConfirmDialog, ConvertDialog, CreateDialog, FormatDialog, FormatDiskDialog,
   LabelDialog, LetterDialog, ResizeDialog, WipeDialog,
 } from './components/Dialogs';
 import { IconDisk, IconRefresh, IconShield, IconWarn } from './components/Icons';
@@ -20,6 +20,7 @@ type DialogState =
   | { kind: 'label'; disk: Disk; part: Partition }
   | { kind: 'letter'; disk: Disk; part: Partition }
   | { kind: 'convert'; disk: Disk }
+  | { kind: 'formatDisk'; disk: Disk }
   | { kind: 'delete'; disk: Disk; part: Partition }
   | { kind: 'wipe'; disk: Disk; part: Partition }
   | null;
@@ -152,7 +153,7 @@ export function App() {
     if (busy || staged || loading) return;
     if (!selDisk) return;
     if (kind === 'create' && selFree) return setDialog({ kind, disk: selDisk, region: selFree });
-    if (kind === 'convert') return setDialog({ kind, disk: selDisk });
+    if (kind === 'convert' || kind === 'formatDisk') return setDialog({ kind, disk: selDisk });
     if (selPart) setDialog({ kind, disk: selDisk, part: selPart } as DialogState);
   };
 
@@ -186,6 +187,9 @@ export function App() {
 
   const canAct = !!selPart && !busy && !staged && !loading && !!disks.find(d => d.number === sel?.diskNumber)?.partitions.some(p => p.partitionNumber === selPart.partitionNumber);
   const rawDisk = !!selDisk && selDisk.partitionStyle === 'RAW';
+  const liveSelDisk = disks.find((d) => d.number === sel?.diskNumber);
+  const canFormatDisk = !!selDisk && !!liveSelDisk && !busy && !staged && !loading
+    && !liveSelDisk.isSystem && !liveSelDisk.isBoot && !liveSelDisk.isReadOnly;
 
   return (
     <div className="app">
@@ -221,6 +225,10 @@ export function App() {
         </button>
         <button className="sm danger" disabled={!canAct || rawDisk} onClick={() => open('delete')}>Delete</button>
         <button className="sm danger" disabled={!canAct || rawDisk} onClick={() => open('wipe')}>Wipe</button>
+        <button className="sm danger" disabled={!canFormatDisk} onClick={() => open('formatDisk')}
+                title={liveSelDisk && (liveSelDisk.isSystem || liveSelDisk.isBoot)
+                  ? 'The disk Windows runs from cannot be formatted'
+                  : 'Erase the whole selected disk (SD card, USB stick) and format it as one volume'}>Format Disk</button>
 
         <div className="spacer" />
 
@@ -386,6 +394,19 @@ export function App() {
             target: { kind: 'disk', diskNumber: dialog.disk.number },
             params: { to },
             description: `Convert disk ${dialog.disk.number} to ${to}`,
+          })}
+        />
+      )}
+
+      {dialog?.kind === 'formatDisk' && (
+        <FormatDiskDialog
+          disk={disks.find((d) => d.number === dialog.disk.number) ?? dialog.disk}
+          onClose={() => setDialog(null)}
+          onConfirm={(r) => addOp({
+            kind: 'formatDisk',
+            target: { kind: 'disk', diskNumber: dialog.disk.number },
+            params: r,
+            description: `Format all of disk ${dialog.disk.number} (${dialog.disk.friendlyName || fmt(dialog.disk.size)}) as one ${r.fileSystem} volume (${r.table})${r.label ? ` labelled "${r.label}"` : ''}`,
           })}
         />
       )}

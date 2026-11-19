@@ -81,7 +81,8 @@ export type OpKind =
   | 'letter'
   | 'setActive'
   | 'convertTable'
-  | 'wipe';
+  | 'wipe'
+  | 'formatDisk';
 
 /** Where an operation can physically be carried out. */
 export type Engine = 'online' | 'offline';
@@ -111,10 +112,16 @@ export interface LabelParams   { label: string }
 export interface LetterParams  { driveLetter: string | null }
 export interface ConvertParams { to: 'GPT' | 'MBR' }
 export interface WipeParams    { passes: number }
+/**
+ * Whole-disk format (SD cards, USB sticks): clear the table, write a fresh one
+ * and a single partition spanning the disk, then format it.
+ */
+export interface FormatDiskParams { fileSystem: 'FAT32' | 'exFAT' | 'NTFS'; label: string; table: 'MBR' | 'GPT' }
 
 export type OpParams =
   | ResizeParams | MoveParams | CreateParams | FormatParams
   | LabelParams  | LetterParams | ConvertParams | WipeParams
+  | FormatDiskParams
   | Record<string, never>;
 
 export interface Operation {

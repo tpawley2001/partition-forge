@@ -162,5 +162,28 @@ export function mockDisks(): Disk[] {
     free: [],
   };
 
-  return [d0, d1, d2, d3];
+  const d4: Disk = {
+    number: 4,
+    friendlyName: 'Generic SD/MMC Card',
+    serialNumber: '',
+    size: 63864569856,
+    partitionStyle: 'MBR',
+    busType: 'SD',
+    mediaType: 'Unspecified',
+    sectorSize: 512,
+    physicalSectorSize: 512,
+    isBoot: false,
+    isSystem: false,
+    isOffline: false,
+    isReadOnly: false,
+    health: 'Healthy',
+    diskGuid: null,
+    diskSignature: '5d5d0004',
+    partitions: layout(4, [
+      { size: 59 * GIB, type: 'Basic', mbr: 0x07, fs: 'exFAT', label: 'CAMERA', letter: 'H', usedFraction: 0.41 },
+    ], 'MBR'),
+    free: [],
+  };
+
+  return [d0, d1, d2, d3, d4];
 }

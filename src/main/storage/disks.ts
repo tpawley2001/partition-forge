@@ -74,6 +74,23 @@ export function lastUsableOffset(disk: Disk): number {
   return alignDown(disk.size - reserved);
 }
 
+/**
+ * Whole-disk format puts its single partition at 4 MiB, the SD Association's
+ * allocation-unit boundary for SDHC/SDXC cards; it is also 1 MiB aligned, so
+ * it suits USB sticks and ordinary disks too.
+ */
+export const FORMAT_DISK_OFFSET = 4 * MIB;
+export const MBR_MAX_BYTES = 2199023255552;
+
+/** The partition a whole-disk format creates under the given table style. */
+export function wholeDiskPartition(disk: Disk, table: 'MBR' | 'GPT'): { offset: number; size: number } {
+  const sector = disk.sectorSize || 512;
+  const end = table === 'GPT'
+    ? alignDown(disk.size - 33 * sector)
+    : alignDown(Math.min(disk.size, MBR_MAX_BYTES));
+  return { offset: FORMAT_DISK_OFFSET, size: Math.max(0, end - FORMAT_DISK_OFFSET) };
+}
+
 /** Derives the unallocated gaps Windows never reports as objects. */
 export function computeFreeRegions(disk: Disk): FreeRegion[] {
   const start = firstUsableOffset(disk);
@@ -90,7 +107,10 @@ export function computeFreeRegions(disk: Disk): FreeRegion[] {
   }
   if (end > cursor) gaps.push({ offset: cursor, size: end - cursor });
 
-  return gaps.filter((g) => g.size >= MIN_USABLE_GAP);
+  // SD cards (ours and the SD Association formatter's) start their partition
+  // at 4 MiB; the gap in front of it is alignment, not space to offer.
+  return gaps.filter((g) => g.size >= MIN_USABLE_GAP
+    && !(g.offset === start && g.offset + g.size <= FORMAT_DISK_OFFSET && sorted.length > 0));
 }
 
 const useMock = () => process.env.PF_MOCK === '1' || process.platform !== 'win32';

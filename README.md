@@ -42,6 +42,22 @@ PartitionForge's firmware boot entry. From 0.2.0 on, the uninstaller skips that
 step during an upgrade (`${isUpdated}` in `build/installer.nsh`).
 `PF_UPDATE_URL` points a build at a generic feed instead, for testing.
 
+## Formatting a whole SD card or USB stick
+
+Select the disk and choose **Format Disk**. It clears the partition table,
+writes a new MBR (or GPT) table with one partition starting at 4 MiB (the SD
+Association's alignment) and formats it. It defaults to FAT32 up to 32 GB and
+exFAT above, as the SD standard does. NTFS is also offered. The disk Windows
+runs from is refused, and the dialog warns when the disk does not look
+removable.
+
+Windows will not format FAT32 above 32 GB, but cameras, consoles and 3D printers
+often need it on large cards. For that case `resources/ps/fat32.ps1` writes the
+FAT32 structures itself (Microsoft's FAT spec, 32 KiB clusters, data area on a
+4 MiB boundary). It has been tested on 16 GB and 64 GB virtual disks, with
+`chkdsk` and Linux `fsck.fat` both reporting clean. The whole operation runs
+online, with no restart.
+
 ## Resize limits
 
 Windows' online shrink/grow limits (`Get-PartitionSupportedSize`) take

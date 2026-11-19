@@ -1,8 +1,8 @@
 import type {
   Disk, Operation, OpKind, Partition, Plan, Warning,
-  ResizeParams, MoveParams, CreateParams, ConvertParams, LetterParams,
+  ResizeParams, MoveParams, CreateParams, ConvertParams, LetterParams, FormatDiskParams,
 } from '../../shared/types';
-import { alignDown, alignUp, computeFreeRegions, firstUsableOffset, lastUsableOffset, MIB } from './disks';
+import { alignDown, alignUp, computeFreeRegions, firstUsableOffset, lastUsableOffset, MIB, wholeDiskPartition } from './disks';
 import { validateOperations } from './validation';
 
 /** MBR addresses sectors with 32 bits: 2^32 * 512 B. */
@@ -115,6 +115,25 @@ export function simulate(disks: Disk[], ops: Operation[]): Disk[] {
         }
         break;
       }
+      case 'formatDisk': {
+        const prm = op.params as FormatDiskParams;
+        const geo = wholeDiskPartition(disk, prm.table);
+        disk.partitionStyle = prm.table;
+        disk.partitions = [{
+          diskNumber: disk.number,
+          partitionNumber: synthetic++,
+          driveLetter: null,
+          offset: geo.offset,
+          size: geo.size,
+          typeName: 'Basic',
+          gptType: prm.table === 'GPT' ? '{ebd0a0a2-b9e5-4433-87c0-68b6b72699c7}' : null,
+          mbrType: prm.table === 'MBR' ? (prm.fileSystem === 'FAT32' ? 0x0c : 0x07) : null,
+          isBoot: false, isSystem: false, isActive: false, isHidden: false,
+          guid: null,
+          volume: { fileSystem: prm.fileSystem, label: prm.label, size: geo.size, sizeRemaining: geo.size, health: 'Healthy', uniqueId: '' },
+        }];
+        break;
+      }
     }
     disk.partitions.sort((a, b) => a.offset - b.offset);
     disk.free = computeFreeRegions(disk);
@@ -149,7 +168,7 @@ export function planOperations(disks: Disk[], requested: Operation[]): Plan {
     }
     if (disk.isReadOnly) blockers.push(`Disk ${disk.number} is read-only; clear the read-only flag first.`);
     if (disk.isOffline) blockers.push(`Disk ${disk.number} is offline; bring it online before editing it.`);
-    if (disk.partitionStyle === 'RAW' && op.kind !== 'convertTable' && op.kind !== 'wipe') {
+    if (disk.partitionStyle === 'RAW' && op.kind !== 'convertTable' && op.kind !== 'wipe' && op.kind !== 'formatDisk') {
       blockers.push(`Disk ${disk.number} has no partition table. Convert it to GPT or MBR first.`);
     }
 
@@ -371,6 +390,40 @@ export function planOperations(disks: Disk[], requested: Operation[]): Plan {
         warnings.push({ severity: 'danger', message: `Wiping ${describe(p)} overwrites its addressable sectors and destroys its contents. Remapped SSD cells and snapshots may retain copies.` });
         break;
       }
+
+      /* ---------------------------------------------- formatDisk */
+      case 'formatDisk': {
+        const prm = op.params as FormatDiskParams;
+        // Judge the disk as Windows reported it, not as earlier queue entries left it.
+        const live = findDisk(disks, diskNumber) ?? disk;
+        if (live.isSystem || live.isBoot) {
+          blockers.push(`Disk ${disk.number} holds the running Windows installation or its boot files and cannot be formatted from inside it.`);
+          break;
+        }
+        const geo = wholeDiskPartition(disk, prm.table);
+        if (geo.size < 8 * MIB) { blockers.push(`Disk ${disk.number} is too small to format, or no card is inserted.`); break; }
+        const maxLabel = prm.fileSystem === 'FAT32' ? 11 : prm.fileSystem === 'exFAT' ? 15 : 32;
+        if (prm.label.length > maxLabel) blockers.push(`${prm.fileSystem} volume labels hold at most ${maxLabel} characters.`);
+        if (prm.fileSystem === 'FAT32' && geo.size / (disk.sectorSize || 512) > 0xffffffff) {
+          blockers.push('FAT32 cannot address a volume this large. Choose exFAT or NTFS.');
+        }
+        if (prm.table === 'MBR' && disk.size > MBR_MAX_ADDRESSABLE) {
+          warnings.push({ severity: 'warn', message: `Disk ${disk.number} is ${fmt(disk.size)}; an MBR table reaches only the first ${fmt(MBR_MAX_ADDRESSABLE)}. Choose GPT to use all of it.` });
+        }
+        if (prm.fileSystem === 'FAT32' && geo.size > 32 * GIB) {
+          warnings.push({ severity: 'info', message: `Windows' own formatter stops at 32 GB for FAT32, so PartitionForge writes the ${fmt(geo.size)} FAT32 volume itself.` });
+        }
+        const removable = ['USB', 'SD', 'MMC'].includes(live.busType) || live.mediaType === 'Unspecified';
+        if (!removable) {
+          warnings.push({ severity: 'danger', message: `Disk ${disk.number}${live.friendlyName ? ` (${live.friendlyName})` : ""} does not look like removable media. Check that it is the card or stick you mean to erase.` });
+        }
+        const used = live.partitions.reduce((n, p) => n + (p.volume ? p.volume.size - p.volume.sizeRemaining : 0), 0);
+        warnings.push({
+          severity: 'danger',
+          message: `Formatting disk ${disk.number} (${live.friendlyName || fmt(live.size)}) deletes ${live.partitions.length ? `all ${live.partitions.length} partition(s)${used ? ` and ${fmt(used)} of data` : ''}` : 'everything on it'}.`,
+        });
+        break;
+      }
     }
 
     operations.push(staged);
@@ -417,6 +470,7 @@ export function planOperations(disks: Disk[], requested: Operation[]): Plan {
       if (op.kind === 'create' && prm.driveLetter) blockers.push('Offline creation cannot assign drive letters. Choose no letter, then assign one after restarting.');
       if (op.kind === 'format' && (prm.quick === false || prm.allocationUnit !== undefined)) blockers.push('The offline formatter supports quick format with default allocation size only.');
     }
+    if (op.kind === 'formatDisk') blockers.push('A whole-disk format runs only while Windows is running. Apply the earlier changes to this disk first, or remove them from the queue.');
     if (op.runAfterReboot) blockers.push('Assign drive letters after the offline job finishes; automatic deferred assignment is currently unavailable.');
   }
 
